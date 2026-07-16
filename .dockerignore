@@ -1,0 +1,5 @@
+.git
+.claude
+*.db
+*.exe
+bash.exe.stackdump

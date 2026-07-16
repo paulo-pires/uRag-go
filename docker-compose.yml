@@ -1,0 +1,28 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_models:/root/.ollama
+    ports:
+      - "11434:11434"
+
+  urag-mcp:
+    build: .
+    depends_on:
+      - ollama
+    ports:
+      - "8080:8080" # transporte HTTP/SSE — dá pra conectar uma UI web ou outro cliente na rede
+    volumes:
+      - urag_data:/data
+    command:
+      - mcp
+      - serve
+      - -db=/data/urag_mcp.db
+      - -embedding-base-url=http://ollama:11434
+      - -llm-base-url=http://ollama:11434
+      - -transport=http
+      - -http-addr=:8080
+
+volumes:
+  ollama_models:
+  urag_data:
