@@ -60,8 +60,8 @@ escolha específica.
                     ┌─────────────┐
                     │   Router    │  classifica a pergunta (LLM) e despacha
                     └──────┬──────┘
-        ┌──────────┬───────┼───────┬──────────┐
-        ▼          ▼       ▼       ▼          ▼
+        ┌──────────┬───────┼────────────┐
+        ▼          ▼       ▼            ▼
    ┌────────┐ ┌────────┐ ┌──────┐ ┌────────┐
    │ Vector │ │ Graph  │ │ Tree │ │  SQL   │
    │  RAG   │ │  RAG   │ │(Vec- │ │(Text-  │
