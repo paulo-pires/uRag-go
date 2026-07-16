@@ -9,7 +9,7 @@ import (
 )
 
 // registerTools registra as tools MCP: 6 sempre (vector/graph/tree, add+query
-// cada), mais sql_query só se s.sql != nil (ver Config.SQLDSN).
+// cada), mais sql_query/sql_load só se s.sql != nil.
 func (s *Server) registerTools() {
 	mcp.AddTool(s.mcp, &mcp.Tool{Name: "vector_add", Description: "Adiciona documentos ao Vector RAG (busca por similaridade semântica)."}, s.vectorAdd)
 	mcp.AddTool(s.mcp, &mcp.Tool{Name: "vector_query", Description: "Busca por similaridade semântica no Vector RAG."}, s.vectorQuery)
@@ -19,6 +19,7 @@ func (s *Server) registerTools() {
 	mcp.AddTool(s.mcp, &mcp.Tool{Name: "tree_query", Description: "Navega a árvore hierárquica do documento para responder à pergunta."}, s.treeQuery)
 	if s.sql != nil {
 		mcp.AddTool(s.mcp, &mcp.Tool{Name: "sql_query", Description: "Converte a pergunta em SQL (SELECT) e executa contra o banco configurado."}, s.sqlQuery)
+		mcp.AddTool(s.mcp, &mcp.Tool{Name: "sql_load", Description: "Cria uma tabela e importa dados estruturados em CSV ou JSON."}, s.sqlLoad)
 	}
 }
 
@@ -190,4 +191,20 @@ func (s *Server) sqlQuery(ctx context.Context, _ *mcp.CallToolRequest, in SQLQue
 		return nil, SQLQueryOutput{SQL: generatedSQL}, err
 	}
 	return nil, SQLQueryOutput{SQL: generatedSQL, Rows: rows}, nil
+}
+
+type SQLLoadInput struct {
+	TableName string `json:"table_name" jsonschema:"nome da tabela a ser criada e populada"`
+	Format    string `json:"format" jsonschema:"formato dos dados: csv ou json"`
+	Data      string `json:"data" jsonschema:"conteúdo textual dos dados (CSV com header ou JSON array/objeto)"`
+}
+type SQLLoadOutput struct {
+	OK bool `json:"ok"`
+}
+
+func (s *Server) sqlLoad(ctx context.Context, _ *mcp.CallToolRequest, in SQLLoadInput) (*mcp.CallToolResult, SQLLoadOutput, error) {
+	if err := s.sql.LoadData(ctx, in.TableName, in.Format, in.Data); err != nil {
+		return nil, SQLLoadOutput{OK: false}, err
+	}
+	return nil, SQLLoadOutput{OK: true}, nil
 }

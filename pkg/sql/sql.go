@@ -6,9 +6,12 @@ package sql
 import (
 	"context"
 	"database/sql"
+	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 
 	_ "modernc.org/sqlite"
 
@@ -35,6 +38,7 @@ type generateFunc func(ctx context.Context, prompt string) (string, error)
 
 // Store é o ponto de entrada do Text-to-SQL.
 type Store struct {
+	mu       sync.RWMutex
 	db       *sql.DB
 	schema   string
 	generate generateFunc
@@ -157,7 +161,11 @@ func (s *Store) Close() error {
 // executa e devolve as linhas junto com o SQL gerado (transparência: você vê
 // o que rodou). A validação roda antes de qualquer execução, sem exceção.
 func (s *Store) Query(ctx context.Context, question string) ([]map[string]any, string, error) {
-	raw, err := s.generate(ctx, fmt.Sprintf(generatePrompt, s.schema, question))
+	s.mu.RLock()
+	schema := s.schema
+	s.mu.RUnlock()
+
+	raw, err := s.generate(ctx, fmt.Sprintf(generatePrompt, schema, question))
 	if err != nil {
 		return nil, "", fmt.Errorf("sql: gerar sql: %w", err)
 	}
@@ -250,3 +258,180 @@ func scanRows(rows *sql.Rows) ([]map[string]any, error) {
 	}
 	return results, rows.Err()
 }
+
+// LoadData imports tables from CSV or JSON format.
+func (s *Store) LoadData(ctx context.Context, tableName string, format string, rawData string) error {
+	// Sanitize tableName: only alphanumeric and underscores
+	re := regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
+	if !re.MatchString(tableName) {
+		return fmt.Errorf("nome de tabela inválido: deve conter apenas letras, números e underscores")
+	}
+
+	var headers []string
+	var rows [][]any
+
+	switch strings.ToLower(format) {
+	case "csv":
+		reader := csv.NewReader(strings.NewReader(rawData))
+		records, err := reader.ReadAll()
+		if err != nil {
+			return fmt.Errorf("erro ao ler CSV: %w", err)
+		}
+		if len(records) == 0 {
+			return fmt.Errorf("CSV vazio")
+		}
+		// Headers
+		for _, h := range records[0] {
+			cleanH := strings.TrimSpace(h)
+			if !re.MatchString(cleanH) {
+				cleanH = regexp.MustCompile(`[^a-zA-Z0-9_]`).ReplaceAllString(cleanH, "_")
+				if cleanH == "" || !re.MatchString(cleanH) {
+					cleanH = "col_" + cleanH
+					cleanH = regexp.MustCompile(`[^a-zA-Z0-9_]`).ReplaceAllString(cleanH, "_")
+				}
+			}
+			headers = append(headers, cleanH)
+		}
+		// Data rows
+		for _, r := range records[1:] {
+			row := make([]any, len(headers))
+			for i, val := range r {
+				if i < len(headers) {
+					row[i] = val
+				}
+			}
+			rows = append(rows, row)
+		}
+
+	case "json":
+		var records []map[string]any
+		dec := json.NewDecoder(strings.NewReader(rawData))
+		if err := dec.Decode(&records); err != nil {
+			// Try decoding as single object
+			var single map[string]any
+			if err2 := json.Unmarshal([]byte(rawData), &single); err2 == nil {
+				records = []map[string]any{single}
+			} else {
+				return fmt.Errorf("erro ao ler JSON: %w", err)
+			}
+		}
+		if len(records) == 0 {
+			return fmt.Errorf("JSON vazio")
+		}
+		// Collect all unique keys across records to form stable column headers
+		headerMap := make(map[string]bool)
+		for _, rec := range records {
+			for k := range rec {
+				headerMap[k] = true
+			}
+		}
+		for h := range headerMap {
+			cleanH := strings.TrimSpace(h)
+			if !re.MatchString(cleanH) {
+				cleanH = regexp.MustCompile(`[^a-zA-Z0-9_]`).ReplaceAllString(cleanH, "_")
+				if cleanH == "" || !re.MatchString(cleanH) {
+					cleanH = "col_" + cleanH
+					cleanH = regexp.MustCompile(`[^a-zA-Z0-9_]`).ReplaceAllString(cleanH, "_")
+				}
+			}
+			headers = append(headers, cleanH)
+		}
+
+		// Map objects to rows
+		for _, rec := range records {
+			row := make([]any, len(headers))
+			for i, h := range headers {
+				val, exists := rec[h]
+				if !exists {
+					// try with clean replacement check or check original key
+					for origK := range rec {
+						cleanOrig := regexp.MustCompile(`[^a-zA-Z0-9_]`).ReplaceAllString(strings.TrimSpace(origK), "_")
+						if cleanOrig == h {
+							val = rec[origK]
+							exists = true
+							break
+						}
+					}
+				}
+				if exists {
+					if val == nil {
+						row[i] = nil
+					} else {
+						switch v := val.(type) {
+						case string:
+							row[i] = v
+						default:
+							bytes, _ := json.Marshal(v)
+							row[i] = string(bytes)
+						}
+					}
+				} else {
+					row[i] = nil
+				}
+			}
+			rows = append(rows, row)
+		}
+
+	default:
+		return fmt.Errorf("formato desconhecido: %q. Use 'csv' ou 'json'", format)
+	}
+
+	if len(headers) == 0 {
+		return fmt.Errorf("nenhuma coluna identificada para criação da tabela")
+	}
+
+	// Create table
+	var colDecls []string
+	for _, h := range headers {
+		colDecls = append(colDecls, fmt.Sprintf("%s TEXT", quoteIdent(h)))
+	}
+	createSQL := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)", quoteIdent(tableName), strings.Join(colDecls, ", "))
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("erro ao iniciar transação: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, createSQL); err != nil {
+		return fmt.Errorf("erro ao criar tabela: %w", err)
+	}
+
+	// Insert rows
+	var qMarks []string
+	var colNames []string
+	for _, h := range headers {
+		colNames = append(colNames, quoteIdent(h))
+		qMarks = append(qMarks, "?")
+	}
+	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", quoteIdent(tableName), strings.Join(colNames, ", "), strings.Join(qMarks, ", "))
+
+	stmt, err := tx.PrepareContext(ctx, insertSQL)
+	if err != nil {
+		return fmt.Errorf("erro ao preparar insert: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, row := range rows {
+		if _, err := stmt.ExecContext(ctx, row...); err != nil {
+			return fmt.Errorf("erro ao inserir linha: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("erro ao commitar transação: %w", err)
+	}
+
+	// Recalculate schema
+	schema, err := introspectSchema(s.db)
+	if err != nil {
+		return fmt.Errorf("erro ao atualizar schema: %w", err)
+	}
+	s.schema = schema
+
+	return nil
+}
+

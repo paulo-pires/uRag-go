@@ -92,12 +92,13 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("mcpserver: iniciar tree: %w", err)
 	}
 
-	var sqlStore *urasql.Store
-	if cfg.SQLDSN != "" {
-		sqlStore, err = urasql.New(urasql.Config{DSN: cfg.SQLDSN, LLMProvider: llmProvider, LLMModel: cfg.LLMModel, LLMBaseURL: cfg.LLMBaseURL, LLMAPIKey: cfg.LLMAPIKey})
-		if err != nil {
-			return nil, fmt.Errorf("mcpserver: iniciar sql: %w", err)
-		}
+	sqlDSN := cfg.SQLDSN
+	if sqlDSN == "" {
+		sqlDSN = "urag_sql.db"
+	}
+	sqlStore, err := urasql.New(urasql.Config{DSN: sqlDSN, LLMProvider: llmProvider, LLMModel: cfg.LLMModel, LLMBaseURL: cfg.LLMBaseURL, LLMAPIKey: cfg.LLMAPIKey})
+	if err != nil {
+		return nil, fmt.Errorf("mcpserver: iniciar sql: %w", err)
 	}
 
 	s := &Server{
@@ -126,7 +127,7 @@ func (s *Server) Run(ctx context.Context) error {
 // contexto ser cancelado ou o listener falhar.
 func (s *Server) RunHTTP(ctx context.Context, addr string) error {
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s.mcp }, nil)
-	httpServer := &http.Server{Addr: addr, Handler: handler}
+	httpServer := &http.Server{Addr: addr, Handler: withCORS(handler)}
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- httpServer.ListenAndServe() }()
@@ -137,6 +138,26 @@ func (s *Server) RunHTTP(ctx context.Context, addr string) error {
 	case <-ctx.Done():
 		return httpServer.Shutdown(context.Background())
 	}
+}
+
+// withCORS libera acesso de qualquer origem — necessário pra uma UI web
+// (rodando num domínio/porta diferente, ex: localhost:5173 no Vite dev
+// server) conseguir chamar esse endpoint via fetch/EventSource do
+// navegador. Sem autenticação embutida (mesma postura do resto do
+// transporte HTTP, ver SPEC.md Fase 8) — coloque atrás de um proxy que
+// autentique se for expor além de localhost.
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Mcp-Session-Id, Mcp-Protocol-Version")
+		w.Header().Set("Access-Control-Expose-Headers", "Mcp-Session-Id")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Close libera a conexão do sql store, se configurado.

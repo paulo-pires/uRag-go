@@ -120,6 +120,24 @@ go build -o urag ./cmd/urag
 Isso gera um binário único `urag` (ou `urag.exe` no Windows). Sem CGO, sem
 toolchain C necessária — `CGO_ENABLED=0 go build ...` funciona.
 
+### Windows / PowerShell
+
+Os exemplos deste README usam sintaxe bash (`./urag ...`, `&&` encadeando
+comandos). No PowerShell (5.1, o padrão do Windows), adapte:
+
+```powershell
+go build -o urag.exe .\cmd\urag
+.\urag.exe add -source docs.txt -db .\urag.db
+```
+
+- Binário leva `.exe`, invocado com `.\` em vez de `./`.
+- `&&` só existe a partir do PowerShell 7 — no 5.1, separe os comandos por
+  `;` ou por linha:
+  ```powershell
+  cd uRag-go
+  .\urag.exe mcp serve -transport http -http-addr :8080
+  ```
+
 ## Rodando local
 
 ### CLI: Vector RAG (add/query)
@@ -192,9 +210,8 @@ conhecidas de classificação em modelos pequenos.
 ./urag mcp serve -db ./urag_mcp.db -sql-dsn ./dados.db -transport http -http-addr :8080
 ```
 
-Sobe um servidor [MCP](https://modelcontextprotocol.io) com 7 tools
-(vector/graph/tree têm `_add` e `_query`; SQL só `sql_query`, e só se
-`-sql-dsn` for passado), em dois transportes possíveis via `-transport`:
+Sobe um servidor [MCP](https://modelcontextprotocol.io) com 8 tools
+(vector/graph/tree têm `_add` e `_query`; SQL tem `sql_query` e `sql_load`, sempre ativos por padrão usando `urag_sql.db` se `-sql-dsn` for omitido), em dois transportes possíveis via `-transport`:
 
 | Transporte | Quando usar |
 |---|---|
@@ -206,7 +223,7 @@ Sobe um servidor [MCP](https://modelcontextprotocol.io) com 7 tools
 | `vector_add` / `vector_query` | Vector RAG |
 | `graph_add` / `graph_query` | Graph RAG |
 | `tree_add` / `tree_query` | Vectorless RAG |
-| `sql_query` | Text-to-SQL (só se `-sql-dsn` configurado) |
+| `sql_query` / `sql_load` | Text-to-SQL (sql_load permite importar dados via CSV ou JSON) |
 
 Diferente dos comandos `ask` do CLI (single-shot), o servidor MCP mantém
 **estado em memória entre chamadas** — um agente pode chamar `graph_add`

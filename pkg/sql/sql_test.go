@@ -80,3 +80,53 @@ func TestStoreQueryRejectsUnsafeGeneratedSQL(t *testing.T) {
 		t.Errorf("esperava 2 linhas intactas em users, obtido %d", count)
 	}
 }
+
+func TestLoadData(t *testing.T) {
+	s, err := newStoreWithGenerator(":memory:", nil)
+	if err != nil {
+		t.Fatalf("newStoreWithGenerator: %v", err)
+	}
+	t.Cleanup(func() { s.db.Close() })
+
+	ctx := context.Background()
+
+	// Test CSV load
+	csvData := `name,city,age
+Alice,New York,28
+Bob,Paris,34`
+	if err := s.LoadData(ctx, "people_csv", "csv", csvData); err != nil {
+		t.Fatalf("LoadData CSV: %v", err)
+	}
+
+	// Verify people_csv table exists and has data
+	var count int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM people_csv").Scan(&count); err != nil {
+		t.Fatalf("QueryRow CSV table: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("expected 2 rows in CSV table, got %d", count)
+	}
+
+	// Test JSON load
+	jsonData := `[
+		{"name": "Charlie", "city": "London", "age": 42},
+		{"name": "Diana", "city": "Tokyo", "age": 19}
+	]`
+	if err := s.LoadData(ctx, "people_json", "json", jsonData); err != nil {
+		t.Fatalf("LoadData JSON: %v", err)
+	}
+
+	// Verify people_json table exists and has data
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM people_json").Scan(&count); err != nil {
+		t.Fatalf("QueryRow JSON table: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("expected 2 rows in JSON table, got %d", count)
+	}
+
+	// Verify schema is updated
+	if !strings.Contains(s.schema, "people_csv") || !strings.Contains(s.schema, "people_json") {
+		t.Errorf("schema did not update properly: %q", s.schema)
+	}
+}
+
