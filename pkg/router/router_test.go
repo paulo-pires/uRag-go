@@ -2,13 +2,17 @@ package router
 
 import (
 	"context"
+	"encoding/json"
 	"hash/fnv"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"urag-go/pkg/graph"
 	"urag-go/pkg/rag"
+	"urag-go/pkg/rerank"
 	"urag-go/pkg/sql"
 	"urag-go/pkg/tree"
 )
@@ -55,7 +59,7 @@ func fakeSQLGenerate(_ context.Context, _ string) (string, error) {
 	return "SELECT 1 AS x", nil
 }
 
-func newTestRouter(t *testing.T, classify classifyFunc) *Router {
+func newTestRouter(t *testing.T, classify ClassifyFunc) *Router {
 	t.Helper()
 	v, err := rag.NewWithEmbedding(rag.Config{}, fakeEmbedding)
 	if err != nil {
@@ -70,7 +74,7 @@ func newTestRouter(t *testing.T, classify classifyFunc) *Router {
 	if err != nil {
 		t.Fatalf("sql.NewWithGenerator: %v", err)
 	}
-	return newRouterWithClassifier(v, g, tr, sq, classify)
+	return NewRouterWithClassifier(v, g, tr, sq, classify)
 }
 
 func TestRouterQueryDispatchesToVector(t *testing.T) {
@@ -242,5 +246,54 @@ func TestRouterQueryFallsBackToVectorOnClassifyError(t *testing.T) {
 	}
 	if result.Strategy != StrategyVector {
 		t.Fatalf("esperava fallback StrategyVector quando classify falha, obtido %s", result.Strategy)
+	}
+}
+
+func TestRouterQueryWithReRanker(t *testing.T) {
+	r := newTestRouter(t, func(_ context.Context, _ string) (string, error) { return "vector", nil })
+
+	// Cria servidor HTTP Mock para simular o re-ranker
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Prompt string `json:"prompt"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+
+		w.Header().Set("Content-Type", "application/json")
+		scoreStr := "2"
+		if strings.Contains(req.Prompt, "dormir") {
+			scoreStr = "10"
+		}
+		responseJSON := map[string]string{
+			"response": scoreStr,
+		}
+		json.NewEncoder(w).Encode(responseJSON)
+	}))
+	defer server.Close()
+
+	r.reranker = rerank.New("ollama", "granite4:micro-h", server.URL, "")
+
+	docs := []rag.Document{
+		{ID: "doc1", Content: "cachorros gostam de correr", Source: "notion"},
+		{ID: "doc2", Content: "gatos gostam de dormir", Source: "notion"},
+	}
+	if err := r.AddDocuments(context.Background(), docs); err != nil {
+		t.Fatalf("AddDocuments: %v", err)
+	}
+
+	// Sem re-ranking, cachorros poderia vir antes por similaridade padrão do mock.
+	// Com o re-ranking, o mock dá nota 10 para o prompt contendo "gatos" e 2 para "cachorros".
+	// Então o doc2 (gatos) DEVE ser re-ordenado para primeiro lugar!
+	result, err := r.Query(context.Background(), "qualquer coisa sobre gatos", 2)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+
+	if len(result.Vector) < 2 {
+		t.Fatalf("esperava 2 resultados, obtido %d", len(result.Vector))
+	}
+
+	if result.Vector[0].Document.ID != "doc2" {
+		t.Errorf("esperava doc2 (gatos) em primeiro após re-ranking, obtido: %s", result.Vector[0].Document.ID)
 	}
 }

@@ -18,12 +18,12 @@ type vectorStore struct {
 	ann           *hnsw.Graph[string] // nil quando Config.Index != "hnsw"
 }
 
-func newVectorStore(cfg Config) (*vectorStore, error) {
+func newVectorStore(cfg Config, cache *EmbeddingCache) (*vectorStore, error) {
 	embeddingFunc, err := embeddingFuncFor(cfg)
 	if err != nil {
 		return nil, err
 	}
-	return newVectorStoreWithEmbedding(cfg, embeddingFunc)
+	return newVectorStoreWithEmbedding(cfg, wrapWithCache(cache, embeddingFunc))
 }
 
 // newVectorStoreWithEmbedding permite injetar um EmbeddingFunc fake em testes,
@@ -186,4 +186,21 @@ func matchesWhere(meta, where map[string]string) bool {
 		}
 	}
 	return true
+}
+
+func (v *vectorStore) getByID(ctx context.Context, id string) (Document, error) {
+	doc, err := v.collection.GetByID(ctx, id)
+	if err != nil {
+		return Document{}, err
+	}
+	return Document{
+		ID:      doc.ID,
+		Content: doc.Content,
+		Source:  doc.Metadata["source"],
+		Meta:    doc.Metadata,
+	}, nil
+}
+
+func (v *vectorStore) generateEmbedding(ctx context.Context, text string) ([]float32, error) {
+	return v.embeddingFunc(ctx, text)
 }

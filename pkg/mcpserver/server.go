@@ -7,12 +7,14 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"urag-go/pkg/graph"
 	"urag-go/pkg/rag"
 	urasql "urag-go/pkg/sql"
+	"urag-go/pkg/telemetry"
 	"urag-go/pkg/tree"
 )
 
@@ -43,6 +45,12 @@ type Config struct {
 	LLMAPIKey string
 	// SQLDSN: caminho do banco SQLite. "" = tool sql_query não é registrada.
 	SQLDSN string
+	// GraphPersist: DSN para persistência do grafo (ex: "file:graph.db")
+	GraphPersist string
+	// EmbeddingCacheSize: tamanho do cache de embeddings
+	EmbeddingCacheSize int
+	// EmbeddingCacheTTL: TTL do cache de embeddings
+	EmbeddingCacheTTL time.Duration
 }
 
 // Server é o servidor MCP do uRag-go, com as 4 stores já instanciadas.
@@ -52,6 +60,7 @@ type Server struct {
 	graph  *graph.GraphStore
 	tree   *tree.Tree
 	sql    *urasql.Store
+	config Config
 }
 
 // New cria o Server: instancia vector/graph/tree sempre; sql só se cfg.SQLDSN
@@ -72,6 +81,8 @@ func New(cfg Config) (*Server, error) {
 		EmbeddingAPIKey:   cfg.EmbeddingAPIKey,
 		EmbeddingBaseURL:  cfg.EmbeddingBaseURL,
 		PersistPath:       cfg.VectorDBPath,
+		CacheSize:         cfg.EmbeddingCacheSize,
+		CacheTTL:          cfg.EmbeddingCacheTTL,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("mcpserver: iniciar vector: %w", err)
@@ -81,13 +92,33 @@ func New(cfg Config) (*Server, error) {
 	if llmProvider == "" {
 		llmProvider = "ollama"
 	}
+	llmModel := cfg.LLMModel
+	if llmModel == "" {
+		llmModel = "granite4:micro-h"
+	}
 
-	g, err := graph.New(graph.Config{LLMProvider: llmProvider, LLMModel: cfg.LLMModel, LLMBaseURL: cfg.LLMBaseURL, LLMAPIKey: cfg.LLMAPIKey})
+	// Graph RAG com persistência
+	graphCfg := graph.Config{
+		LLMProvider:    llmProvider,
+		LLMModel:       llmModel,
+		LLMBaseURL:     cfg.LLMBaseURL,
+		LLMAPIKey:      cfg.LLMAPIKey,
+		PersistDSN:     cfg.GraphPersist,
+		PersistEnabled: cfg.GraphPersist != "",
+		CacheSize:      1000,
+		CacheTTL:       5 * time.Minute,
+	}
+	g, err := graph.New(graphCfg)
 	if err != nil {
 		return nil, fmt.Errorf("mcpserver: iniciar graph: %w", err)
 	}
 
-	t, err := tree.New(tree.Config{LLMProvider: llmProvider, LLMModel: cfg.LLMModel, LLMBaseURL: cfg.LLMBaseURL, LLMAPIKey: cfg.LLMAPIKey})
+	t, err := tree.New(tree.Config{
+		LLMProvider: llmProvider,
+		LLMModel:    llmModel,
+		LLMBaseURL:  cfg.LLMBaseURL,
+		LLMAPIKey:   cfg.LLMAPIKey,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("mcpserver: iniciar tree: %w", err)
 	}
@@ -96,7 +127,13 @@ func New(cfg Config) (*Server, error) {
 	if sqlDSN == "" {
 		sqlDSN = "urag_sql.db"
 	}
-	sqlStore, err := urasql.New(urasql.Config{DSN: sqlDSN, LLMProvider: llmProvider, LLMModel: cfg.LLMModel, LLMBaseURL: cfg.LLMBaseURL, LLMAPIKey: cfg.LLMAPIKey})
+	sqlStore, err := urasql.New(urasql.Config{
+		DSN:         sqlDSN,
+		LLMProvider: llmProvider,
+		LLMModel:    llmModel,
+		LLMBaseURL:  cfg.LLMBaseURL,
+		LLMAPIKey:   cfg.LLMAPIKey,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("mcpserver: iniciar sql: %w", err)
 	}
@@ -107,6 +144,7 @@ func New(cfg Config) (*Server, error) {
 		graph:  g,
 		tree:   t,
 		sql:    sqlStore,
+		config: cfg,
 	}
 	s.registerTools()
 	return s, nil
@@ -126,8 +164,14 @@ func (s *Server) Run(ctx context.Context) error {
 // de escopo já registrada no SPEC.md pro transporte stdio. Bloqueia até o
 // contexto ser cancelado ou o listener falhar.
 func (s *Server) RunHTTP(ctx context.Context, addr string) error {
-	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s.mcp }, nil)
-	httpServer := &http.Server{Addr: addr, Handler: withCORS(handler)}
+	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s.mcp }, nil)
+
+	mux := http.NewServeMux()
+	mux.Handle("/", mcpHandler)
+	mux.HandleFunc("/mcp/stream", s.handleStream)
+	mux.HandleFunc("/metrics", s.handleMetrics)
+
+	httpServer := &http.Server{Addr: addr, Handler: withCORS(mux)}
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- httpServer.ListenAndServe() }()
@@ -160,10 +204,39 @@ func withCORS(next http.Handler) http.Handler {
 	})
 }
 
-// Close libera a conexão do sql store, se configurado.
+// Close libera as conexões
 func (s *Server) Close() error {
+	var errs []string
+
+	if s.vector != nil {
+		if err := s.vector.Close(); err != nil {
+			errs = append(errs, fmt.Sprintf("vector: %v", err))
+		}
+	}
+
+	if s.graph != nil {
+		if err := s.graph.Close(); err != nil {
+			errs = append(errs, fmt.Sprintf("graph: %v", err))
+		}
+	}
+
+	// tree não tem Close, apenas ignorar
+
 	if s.sql != nil {
-		return s.sql.Close()
+		if err := s.sql.Close(); err != nil {
+			errs = append(errs, fmt.Sprintf("sql: %v", err))
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("close errors: %s", errs)
 	}
 	return nil
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(telemetry.GlobalCollector.RenderPrometheus()))
 }

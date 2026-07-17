@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"urag-go/internal/ollama"
 	"urag-go/pkg/graph"
 	"urag-go/pkg/rag"
+	"urag-go/pkg/rerank"
 	"urag-go/pkg/sql"
+	"urag-go/pkg/telemetry"
 	"urag-go/pkg/tree"
 )
 
@@ -45,14 +48,15 @@ const (
 // configuração parcial (ex: só vector+graph sem tree/sql); use os pacotes
 // individualmente se não precisar do roteamento completo.
 type Config struct {
-	Vector rag.Config
-	Graph  graph.Config
-	Tree   tree.Config
-	SQL    sql.Config
-	// RouterModel: modelo Ollama para classificação da pergunta. Vazio usa
-	// defaultRouterModel — uma tarefa de classificação não precisa do mesmo
-	// modelo usado na extração de entidades do Graph RAG.
+	Vector      rag.Config
+	Graph       graph.Config
+	Tree        tree.Config
+	SQL         sql.Config
 	RouterModel string
+
+	// Re-ranking Cross-Encoder por LLM
+	ReRankEnabled bool
+	ReRankModel   string
 }
 
 // QueryResult carrega o resultado nativo da store escolhida — só os campos
@@ -67,7 +71,7 @@ type QueryResult struct {
 	SQLQuery string // SQL gerado, preenchido só quando Strategy == StrategySQL
 }
 
-type classifyFunc func(ctx context.Context, prompt string) (string, error)
+type ClassifyFunc func(ctx context.Context, prompt string) (string, error)
 
 // Router é o ponto de entrada: uma pergunta, uma estratégia escolhida.
 type Router struct {
@@ -75,7 +79,8 @@ type Router struct {
 	graph    *graph.GraphStore
 	tree     *tree.Tree
 	sql      *sql.Store
-	classify classifyFunc
+	classify ClassifyFunc
+	reranker *rerank.ReRanker
 }
 
 // New cria um Router a partir de Config, iniciando as quatro stores.
@@ -105,12 +110,27 @@ func New(cfg Config) (*Router, error) {
 		return ollama.Complete(ctx, "", model, prompt, false)
 	}
 
-	return newRouterWithClassifier(v, g, tr, sq, classify), nil
+	var rrk *rerank.ReRanker
+	if cfg.ReRankEnabled {
+		provider := cfg.SQL.LLMProvider
+		if provider == "" {
+			provider = "ollama"
+		}
+		rrkModel := cfg.ReRankModel
+		if rrkModel == "" {
+			rrkModel = cfg.SQL.LLMModel
+		}
+		rrk = rerank.New(provider, rrkModel, cfg.SQL.LLMBaseURL, cfg.SQL.LLMAPIKey)
+	}
+
+	r := NewRouterWithClassifier(v, g, tr, sq, classify)
+	r.reranker = rrk
+	return r, nil
 }
 
-// newRouterWithClassifier permite injetar um classifyFunc fake em testes,
+// NewRouterWithClassifier permite injetar um ClassifyFunc fake em testes,
 // sem depender de Ollama rodando.
-func newRouterWithClassifier(v *rag.UnifiedRAG, g *graph.GraphStore, tr *tree.Tree, sq *sql.Store, classify classifyFunc) *Router {
+func NewRouterWithClassifier(v *rag.UnifiedRAG, g *graph.GraphStore, tr *tree.Tree, sq *sql.Store, classify ClassifyFunc) *Router {
 	return &Router{vector: v, graph: g, tree: tr, sql: sq, classify: classify}
 }
 
@@ -164,7 +184,23 @@ Resposta:`
 
 // Query classifica a pergunta e despacha para a(s) store(s) escolhida(s).
 func (r *Router) Query(ctx context.Context, question string, topK int) (QueryResult, error) {
-	switch r.classifyStrategy(ctx, question) {
+	telemetry.GlobalCollector.RecordQuery()
+	start := time.Now()
+	strategy := r.classifyStrategy(ctx, question)
+	telemetry.GlobalCollector.RecordRouterDecision(string(strategy))
+
+	res, err := r.executeQuery(ctx, strategy, question, topK)
+	if err != nil {
+		telemetry.GlobalCollector.RecordError()
+		return QueryResult{}, err
+	}
+
+	telemetry.GlobalCollector.RecordLatency(string(strategy), time.Since(start))
+	return res, nil
+}
+
+func (r *Router) executeQuery(ctx context.Context, strategy Strategy, question string, topK int) (QueryResult, error) {
+	switch strategy {
 	case StrategyGraph:
 		results, err := r.graph.Query(ctx, question, graphQueryHops)
 		if err != nil {
@@ -176,6 +212,7 @@ func (r *Router) Query(ctx context.Context, question string, topK int) (QueryRes
 		if err != nil {
 			return QueryResult{}, err
 		}
+		vecResults = r.rerankVector(ctx, question, vecResults)
 		return QueryResult{Strategy: StrategyBoth, Vector: vecResults, Graph: graphResults}, nil
 	case StrategyTree:
 		results, err := r.tree.Query(ctx, question, treeMaxDepth)
@@ -194,8 +231,42 @@ func (r *Router) Query(ctx context.Context, question string, topK int) (QueryRes
 		if err != nil {
 			return QueryResult{}, fmt.Errorf("router: vector query: %w", err)
 		}
+		results = r.rerankVector(ctx, question, results)
 		return QueryResult{Strategy: StrategyVector, Vector: results}, nil
 	}
+}
+
+func (r *Router) rerankVector(ctx context.Context, question string, results []rag.SearchResult) []rag.SearchResult {
+	if r.reranker == nil || len(results) == 0 {
+		return results
+	}
+	var toRerank []rerank.Result
+	for _, res := range results {
+		toRerank = append(toRerank, rerank.Result{
+			DocumentID: res.Document.ID,
+			Content:    res.Document.Content,
+			Score:      res.Score,
+		})
+	}
+	reranked, err := r.reranker.ReRank(ctx, question, toRerank)
+	if err != nil {
+		return results // fallback seguro
+	}
+	var out []rag.SearchResult
+	for _, res := range reranked {
+		var original rag.Document
+		for _, orig := range results {
+			if orig.Document.ID == res.DocumentID {
+				original = orig.Document
+				break
+			}
+		}
+		out = append(out, rag.SearchResult{
+			Document: original,
+			Score:    res.Score,
+		})
+	}
+	return out
 }
 
 // FusedResult carrega resultados de vector e graph juntos, sem tentar unificar

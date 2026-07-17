@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"urag-go/pkg/graph/persist"
 	"urag-go/pkg/rag"
 )
 
@@ -24,7 +25,7 @@ func fakeExtraction(_ context.Context, prompt string) (string, error) {
 }
 
 func TestGraphStoreAddQueryMultiHop(t *testing.T) {
-	g := newGraphStoreWithCompletion(fakeExtraction)
+	g := newGraphStoreWithCompletion(fakeExtraction, persist.Config{})
 
 	docs := []rag.Document{
 		{ID: "doc1", Content: "Maria trabalha na empresa Ignus."},
@@ -57,7 +58,7 @@ func TestGraphStoreAddQueryMultiHop(t *testing.T) {
 }
 
 func TestGraphStoreQueryOneHopStopsBeforeSecondHop(t *testing.T) {
-	g := newGraphStoreWithCompletion(fakeExtraction)
+	g := newGraphStoreWithCompletion(fakeExtraction, persist.Config{})
 
 	docs := []rag.Document{
 		{ID: "doc1", Content: "Maria trabalha na empresa Ignus."},
@@ -88,7 +89,7 @@ func TestGraphStoreAddDocumentsSkipsInvalidJSON(t *testing.T) {
 		return `{"entities":[{"name":"X","type":"T"}],"relations":[]}`, nil
 	}
 
-	g := newGraphStoreWithCompletion(badThenGood)
+	g := newGraphStoreWithCompletion(badThenGood, persist.Config{})
 	docs := []rag.Document{
 		{ID: "bad", Content: "..."},
 		{ID: "good", Content: "..."},

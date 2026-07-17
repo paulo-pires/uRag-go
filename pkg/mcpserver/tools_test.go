@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"hash/fnv"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -186,5 +188,24 @@ func TestSQLQuery(t *testing.T) {
 	}
 	if out.SQL == "" {
 		t.Fatalf("esperava SQL gerado")
+	}
+}
+
+func TestServerMetricsRoute(t *testing.T) {
+	s := newTestServer(t, false)
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+
+	s.handleMetrics(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("esperava HTTP 200, obtido %d", resp.StatusCode)
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if !strings.HasPrefix(contentType, "text/plain") {
+		t.Errorf("esperava Content-Type text/plain, obtido %q", contentType)
 	}
 }

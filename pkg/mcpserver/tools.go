@@ -13,8 +13,9 @@ import (
 func (s *Server) registerTools() {
 	mcp.AddTool(s.mcp, &mcp.Tool{Name: "vector_add", Description: "Adiciona documentos ao Vector RAG (busca por similaridade semântica)."}, s.vectorAdd)
 	mcp.AddTool(s.mcp, &mcp.Tool{Name: "vector_query", Description: "Busca por similaridade semântica no Vector RAG."}, s.vectorQuery)
-	mcp.AddTool(s.mcp, &mcp.Tool{Name: "graph_add", Description: "Extrai entidades/relações dos documentos e adiciona ao Graph RAG."}, s.graphAdd)
+	mcp.AddTool(s.mcp, &mcp.Tool{Name: "graph_add", Description: "Extrai entidades/relações dos documentos e adiciona ao Graph RAG (persistente se configurado)."}, s.graphAdd)
 	mcp.AddTool(s.mcp, &mcp.Tool{Name: "graph_query", Description: "Busca multi-hop sobre o grafo de entidades/relações."}, s.graphQuery)
+	mcp.AddTool(s.mcp, &mcp.Tool{Name: "graph_stats", Description: "Retorna estatísticas do grafo (número de entidades e relações)."}, s.graphStats)
 	mcp.AddTool(s.mcp, &mcp.Tool{Name: "tree_add", Description: "Adiciona um documento markdown ao Vectorless RAG, parseado em árvore de headings."}, s.treeAdd)
 	mcp.AddTool(s.mcp, &mcp.Tool{Name: "tree_query", Description: "Navega a árvore hierárquica do documento para responder à pergunta."}, s.treeQuery)
 	if s.sql != nil {
@@ -89,7 +90,9 @@ type GraphAddInput struct {
 	Documents []DocumentInput `json:"documents" jsonschema:"documentos dos quais extrair entidades/relações"`
 }
 type GraphAddOutput struct {
-	Added int `json:"added"`
+	Added     int    `json:"added"`
+	Persisted bool   `json:"persisted,omitempty"`
+	DSN       string `json:"dsn,omitempty"`
 }
 
 func (s *Server) graphAdd(ctx context.Context, _ *mcp.CallToolRequest, in GraphAddInput) (*mcp.CallToolResult, GraphAddOutput, error) {
@@ -100,7 +103,18 @@ func (s *Server) graphAdd(ctx context.Context, _ *mcp.CallToolRequest, in GraphA
 	if err := s.graph.AddDocuments(ctx, docs); err != nil {
 		return nil, GraphAddOutput{}, err
 	}
-	return nil, GraphAddOutput{Added: len(docs)}, nil
+
+	output := GraphAddOutput{
+		Added: len(docs),
+	}
+
+	// Verifica se a persistência está habilitada
+	if s.config.GraphPersist != "" {
+		output.Persisted = true
+		output.DSN = s.config.GraphPersist
+	}
+
+	return nil, output, nil
 }
 
 type GraphQueryInput struct {
@@ -114,7 +128,9 @@ type RelationOutput struct {
 	DocID    string `json:"doc_id"`
 }
 type GraphQueryOutput struct {
-	Relations []RelationOutput `json:"relations"`
+	Relations  []RelationOutput       `json:"relations"`
+	Stats      map[string]interface{} `json:"stats,omitempty"`
+	Persistent bool                   `json:"persistent,omitempty"`
 }
 
 func (s *Server) graphQuery(ctx context.Context, _ *mcp.CallToolRequest, in GraphQueryInput) (*mcp.CallToolResult, GraphQueryOutput, error) {
@@ -126,11 +142,34 @@ func (s *Server) graphQuery(ctx context.Context, _ *mcp.CallToolRequest, in Grap
 	if err != nil {
 		return nil, GraphQueryOutput{}, err
 	}
+
 	out := make([]RelationOutput, len(rels))
 	for i, r := range rels {
 		out[i] = RelationOutput{Source: r.Source, Target: r.Target, Relation: r.Relation, DocID: r.DocID}
 	}
-	return nil, GraphQueryOutput{Relations: out}, nil
+
+	output := GraphQueryOutput{
+		Relations: out,
+		Stats:     s.graph.GetStats(),
+	}
+
+	if s.config.GraphPersist != "" {
+		output.Persistent = true
+	}
+
+	return nil, output, nil
+}
+
+// graphStats retorna estatísticas do grafo
+func (s *Server) graphStats(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, map[string]interface{}, error) {
+	stats := s.graph.GetStats()
+
+	if s.config.GraphPersist != "" {
+		stats["persistent"] = true
+		stats["dsn"] = s.config.GraphPersist
+	}
+
+	return nil, stats, nil
 }
 
 type TreeAddInput struct {
