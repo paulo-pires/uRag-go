@@ -1,0 +1,31 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Build output
+/urag
+/urag_mcp.db/
+/urag_mcp.db
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# IDE / tools
+.claude/
+.vscode/
+.idea/
+
+# Crash dumps
+*.stackdump
+
+# Go test cache
+*.test
+*.out
+
+# Temp
+tmp/

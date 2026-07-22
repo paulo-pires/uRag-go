@@ -10,7 +10,7 @@ import (
 	chromem "github.com/philippgille/chromem-go"
 )
 
-// Config configura o UnifiedRAG. No MVP cobre apenas o Vector RAG.
+// Config configura o UnifiedRAG.
 type Config struct {
 	// EmbeddingProvider: "ollama" ou "openai".
 	EmbeddingProvider string
@@ -18,26 +18,38 @@ type Config struct {
 	EmbeddingModel string
 	// EmbeddingAPIKey: obrigatório apenas para providers hosted (ex: openai).
 	EmbeddingAPIKey string
-	// EmbeddingBaseURL: override do endpoint Ollama. "" = default
-	// (localhost:11434) — precisa ser setado ao rodar contra um Ollama remoto
-	// ou em outro host de rede (ex: container "ollama" num docker-compose).
+	// EmbeddingBaseURL: override do endpoint Ollama. "" = default (localhost:11434).
 	EmbeddingBaseURL string
-	// PersistPath: caminho do arquivo de persistência. Vazio = in-memory.
+	// PersistPath: persistência do chromem-go. Vazio = in-memory. Ignorado para VectorBackend=qdrant.
 	PersistPath string
-	// Index: "" (exaustivo, default) ou "hnsw" (aproximado, via github.com/coder/hnsw).
-	// hnsw não é combinável com PersistPath — o índice ANN não é persistido, então
-	// um restart o perderia silenciosamente; New retorna erro nesse caso.
+	// Index: "" (exaustivo, default) ou "hnsw". Ignorado para VectorBackend=qdrant.
 	Index string
-	// CacheSize: tamanho máximo do cache de embeddings (default: 1000)
+	// CacheSize: tamanho máximo do cache de embeddings (default: 1000).
 	CacheSize int
-	// CacheTTL: TTL dos itens no cache (default: 5 minutos)
+	// CacheTTL: TTL dos itens no cache (default: 5 minutos).
 	CacheTTL time.Duration
+	// VectorBackend: "" ou "chromem" (default) | "qdrant".
+	VectorBackend string
+	// QdrantURL: endpoint REST do Qdrant (default "http://localhost:6333").
+	QdrantURL string
+	// QdrantCollection: nome da collection no Qdrant (default "documents").
+	QdrantCollection string
+	// QdrantAPIKey: API key para Qdrant Cloud. "" = sem autenticação.
+	QdrantAPIKey string
+}
+
+// vectorBackend é a interface interna de UnifiedRAG.
+// Implementada por *vectorStore (chromem) e *qdrantStore.
+type vectorBackend interface {
+	add(ctx context.Context, docs []Document) error
+	query(ctx context.Context, question string, topK int, where, whereDocument map[string]string) ([]SearchResult, error)
+	getByID(ctx context.Context, id string) (Document, error)
+	generateEmbedding(ctx context.Context, text string) ([]float32, error)
 }
 
 // UnifiedRAG é o ponto de entrada da biblioteca.
 type UnifiedRAG struct {
-	vector *vectorStore
-	store  *chromem.Collection
+	vector vectorBackend
 	config Config
 	cache  *EmbeddingCache
 }
@@ -53,17 +65,26 @@ func New(cfg Config) (*UnifiedRAG, error) {
 
 	cache := NewEmbeddingCache(cfg.CacheSize, cfg.CacheTTL)
 
-	v, err := newVectorStore(cfg, cache)
-	if err != nil {
-		return nil, err
+	var v vectorBackend
+	var err error
+	if cfg.VectorBackend == "qdrant" {
+		embFn, embErr := embeddingFuncFor(cfg)
+		if embErr != nil {
+			return nil, embErr
+		}
+		v = newQdrantStore(cfg, wrapWithCache(cache, embFn))
+	} else {
+		v, err = newVectorStore(cfg, cache)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return &UnifiedRAG{vector: v, config: cfg, cache: cache}, nil
 }
 
-// NewWithEmbedding cria um UnifiedRAG com um EmbeddingFunc já pronto, sem passar
-// pelo provider resolvido a partir de Config.EmbeddingProvider/EmbeddingModel —
-// útil para embedding funcs customizados (provider fora de "ollama"/"openai") ou
-// para injetar um fake em testes.
+// NewWithEmbedding cria um UnifiedRAG com um EmbeddingFunc já pronto — útil para
+// injetar um fake em testes ou usar um provider customizado.
+// Apenas o backend chromem é suportado neste path; para Qdrant use New().
 func NewWithEmbedding(cfg Config, embeddingFunc chromem.EmbeddingFunc) (*UnifiedRAG, error) {
 	if cfg.CacheSize <= 0 {
 		cfg.CacheSize = 1000

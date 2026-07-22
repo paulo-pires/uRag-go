@@ -1,0 +1,34 @@
+# urag-go — Config YAML de servidor
+#
+# Copie para config.yaml e passe com: urag mcp serve -config config.yaml
+# Qualquer flag CLI sobrescreve os valores aqui configurados.
+
+server:
+  transport: "http"        # stdio | http
+  http_addr: ":8080"
+  metrics_port: ":9090"   # porta Prometheus (vazio = desabilitado)
+
+vector:
+  db_path: "./urag_mcp.db"
+
+embedding:
+  provider: "ollama"       # ollama | openai
+  model: "nomic-embed-text"
+  base_url: ""             # ex: http://ollama:11434 em docker-compose
+  api_key: ""
+
+llm:
+  provider: "ollama"
+  model: "granite4:micro-h"
+  base_url: ""
+  api_key: ""
+
+sql:
+  dsn: "./urag_sql.db"     # vazio = desabilitado
+
+graph:
+  persist_dsn: ""          # ex: file:graph.db (vazio = in-memory)
+
+cache:
+  embedding_size: 1000     # entradas máximas no cache de embeddings
+  embedding_ttl: "5m"      # TTL de cada entrada (ex: 5m, 1h)

@@ -1,19 +1,18 @@
 package persist
 
 import (
-	"database/sql"
-
-	_ "modernc.org/sqlite"
+	"strings"
 )
 
 // Schema representa o schema do banco de dados
 type Schema struct {
-	db *sql.DB
+	db     DBConn
+	dbType string
 }
 
 // NewSchema cria um novo schema
-func NewSchema(db *sql.DB) *Schema {
-	return &Schema{db: db}
+func NewSchema(db DBConn, dbType string) *Schema {
+	return &Schema{db: db, dbType: dbType}
 }
 
 // CreateTables cria as tabelas necessárias
@@ -27,7 +26,7 @@ func (s *Schema) CreateTables() error {
             properties JSON,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )`,
+		)`,
 
 		// Índice para busca por nome
 		`CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name)`,
@@ -45,7 +44,7 @@ func (s *Schema) CreateTables() error {
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (source_id) REFERENCES entities(id) ON DELETE CASCADE,
             FOREIGN KEY (target_id) REFERENCES entities(id) ON DELETE CASCADE
-        )`,
+		)`,
 
 		// Índices para relações
 		`CREATE INDEX IF NOT EXISTS idx_relations_source ON relations(source_id)`,
@@ -60,10 +59,14 @@ func (s *Schema) CreateTables() error {
             key TEXT PRIMARY KEY,
             value TEXT,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )`,
+		)`,
 	}
 
 	for _, query := range queries {
+		if s.dbType == "postgres" {
+			query = strings.ReplaceAll(query, "DATETIME", "TIMESTAMP")
+			query = strings.ReplaceAll(query, "JSON", "JSONB")
+		}
 		if _, err := s.db.Exec(query); err != nil {
 			return err
 		}
@@ -78,6 +81,7 @@ func (s *Schema) Migrate() error {
 	_, err := s.db.Exec(`
         INSERT OR IGNORE INTO graph_metadata (key, value) 
         VALUES ('schema_version', '1.0.0')
-    `)
+	`)
 	return err
 }
+

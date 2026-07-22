@@ -413,6 +413,19 @@ go build ./... && go vet ./... && go test ./...
 Todos os testes usam fakes (embedding/completion/navigate/generate
 determinísticos) — nenhum depende de Ollama ou rede real rodando.
 
+## Ecossistema uRag
+
+Este é o núcleo — os demais projetos irmãos (mesmo diretório pai) consomem
+este via HTTP, nenhum importa `pkg/*` diretamente:
+
+| Projeto | Papel |
+|---|---|
+| **uRag-go** (este) | Stores Vector/Graph/Tree/SQL + Router + servidor MCP |
+| [urag-adk-go](../urag-adk-go) | Loop ReAct (ADK v2) que usa as stores acima como tools — substituiu o antigo `uRag-agent-go` |
+| [uRag-gateway-go](../uRag-gateway-go) | Fachada REST única, decide entre RAG direto (aqui) ou o agente |
+| [uRag-workflow-go](../uRag-workflow-go) | Motor de pipelines/DAG, chama o agente via `agentNode` |
+| [urag-front](../urag-front) | UI web, conecta direto no servidor MCP deste projeto |
+
 ## Licença
 
 [MIT](LICENSE).

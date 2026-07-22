@@ -13,6 +13,7 @@ import (
 
 	"urag-go/pkg/graph"
 	"urag-go/pkg/rag"
+	"urag-go/pkg/router"
 	urasql "urag-go/pkg/sql"
 	"urag-go/pkg/telemetry"
 	"urag-go/pkg/tree"
@@ -20,6 +21,9 @@ import (
 
 // Config configura o servidor MCP.
 type Config struct {
+	// RAGToken: se não-vazio, todas as requests HTTP devem incluir
+	// o header X-RAG-Token com este valor. "" = sem autenticação.
+	RAGToken string
 	// VectorDBPath: persistência do vector store (chromem-go). "" = in-memory.
 	VectorDBPath string
 	// EmbeddingProvider: "ollama" (default) ou "openai".
@@ -60,6 +64,7 @@ type Server struct {
 	graph  *graph.GraphStore
 	tree   *tree.Tree
 	sql    *urasql.Store
+	router *router.Router
 	config Config
 }
 
@@ -146,6 +151,19 @@ func New(cfg Config) (*Server, error) {
 		sql:    sqlStore,
 		config: cfg,
 	}
+
+	// Router combina todas as stores para roteamento automático
+	r, routerErr := router.New(router.Config{
+		Vector:      rag.Config{EmbeddingProvider: embeddingProvider, EmbeddingModel: embeddingModel, EmbeddingAPIKey: cfg.EmbeddingAPIKey, EmbeddingBaseURL: cfg.EmbeddingBaseURL},
+		Graph:       graphCfg,
+		Tree:        tree.Config{LLMProvider: llmProvider, LLMModel: llmModel, LLMBaseURL: cfg.LLMBaseURL, LLMAPIKey: cfg.LLMAPIKey},
+		SQL:         urasql.Config{DSN: sqlDSN, LLMProvider: llmProvider, LLMModel: llmModel, LLMBaseURL: cfg.LLMBaseURL, LLMAPIKey: cfg.LLMAPIKey},
+		RouterModel: llmModel,
+	})
+	if routerErr == nil {
+		s.router = r
+	}
+
 	s.registerTools()
 	return s, nil
 }
@@ -171,7 +189,23 @@ func (s *Server) RunHTTP(ctx context.Context, addr string) error {
 	mux.HandleFunc("/mcp/stream", s.handleStream)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 
-	httpServer := &http.Server{Addr: addr, Handler: withCORS(mux)}
+	healthHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	authedHandler := withCORS(withAuth(s.config.RAGToken, mux))
+
+	mainHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			healthHandler.ServeHTTP(w, r)
+			return
+		}
+		authedHandler.ServeHTTP(w, r)
+	})
+
+	httpServer := &http.Server{Addr: addr, Handler: mainHandler}
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- httpServer.ListenAndServe() }()
@@ -190,11 +224,21 @@ func (s *Server) RunHTTP(ctx context.Context, addr string) error {
 // navegador. Sem autenticação embutida (mesma postura do resto do
 // transporte HTTP, ver SPEC.md Fase 8) — coloque atrás de um proxy que
 // autentique se for expor além de localhost.
+func withAuth(token string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if token != "" && r.Header.Get("X-RAG-Token") != token {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Mcp-Session-Id, Mcp-Protocol-Version")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Mcp-Session-Id, Mcp-Protocol-Version, X-RAG-Token")
 		w.Header().Set("Access-Control-Expose-Headers", "Mcp-Session-Id")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

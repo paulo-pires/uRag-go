@@ -17,6 +17,10 @@ import (
 
 const DefaultBaseURL = "https://api.openai.com/v1"
 
+// uragSource identifica este binário pro guardrail scope do uRag-guard-go
+// (ver ignus-code-landing-page/proxy/guardrails.go, header X-Urag-Source).
+const uragSource = "urag-go"
+
 // Complete pede uma resposta de texto para um prompt via Chat Completions API.
 // jsonFormat pede response_format=json_object (suportado pela OpenAI e pela
 // maioria dos providers compatíveis modernos); deixe false para texto livre.
@@ -45,6 +49,7 @@ func Complete(ctx context.Context, baseURL, apiKey, model, prompt string, jsonFo
 		return "", fmt.Errorf("openai: criar request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Urag-Source", uragSource)
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
@@ -100,6 +105,7 @@ func StreamComplete(ctx context.Context, baseURL, apiKey, model, prompt string, 
 		return fmt.Errorf("openai: criar request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Urag-Source", uragSource)
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}

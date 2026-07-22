@@ -1,8 +1,16 @@
 package rag
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
 
 	"urag-go/internal/hnsw"
 	chromem "github.com/philippgille/chromem-go"
@@ -16,6 +24,7 @@ type vectorStore struct {
 	collection    *chromem.Collection
 	embeddingFunc chromem.EmbeddingFunc
 	ann           *hnsw.Graph[string] // nil quando Config.Index != "hnsw"
+	hnswPath      string              // caminho do arquivo hnsw.bin; "" = sem persistência
 }
 
 func newVectorStore(cfg Config, cache *EmbeddingCache) (*vectorStore, error) {
@@ -33,9 +42,6 @@ func newVectorStoreWithEmbedding(cfg Config, embeddingFunc chromem.EmbeddingFunc
 	case "", "hnsw":
 	default:
 		return nil, fmt.Errorf("rag: index desconhecido: %q", cfg.Index)
-	}
-	if cfg.Index == "hnsw" && cfg.PersistPath != "" {
-		return nil, fmt.Errorf("rag: Index=hnsw não é combinável com PersistPath (índice ANN não é persistido)")
 	}
 
 	var db *chromem.DB
@@ -55,11 +61,19 @@ func newVectorStoreWithEmbedding(cfg Config, embeddingFunc chromem.EmbeddingFunc
 	}
 
 	var ann *hnsw.Graph[string]
+	var hnswPath string
 	if cfg.Index == "hnsw" {
 		ann = hnsw.NewGraph[string]()
+		if cfg.PersistPath != "" {
+			hnswPath = filepath.Join(cfg.PersistPath, "hnsw.bin")
+			if f, err := os.Open(hnswPath); err == nil {
+				_ = ann.Import(f)
+				f.Close()
+			}
+		}
 	}
 
-	return &vectorStore{db: db, collection: collection, embeddingFunc: embeddingFunc, ann: ann}, nil
+	return &vectorStore{db: db, collection: collection, embeddingFunc: embeddingFunc, ann: ann, hnswPath: hnswPath}, nil
 }
 
 func embeddingFuncFor(cfg Config) (chromem.EmbeddingFunc, error) {
@@ -71,15 +85,70 @@ func embeddingFuncFor(cfg Config) (chromem.EmbeddingFunc, error) {
 		}
 		return chromem.NewEmbeddingFuncOllama(model, cfg.EmbeddingBaseURL), nil
 	case "openai":
+		if cfg.EmbeddingBaseURL != "" {
+			return newCustomOpenAIEmbedding(cfg.EmbeddingBaseURL, cfg.EmbeddingAPIKey, cfg.EmbeddingModel), nil
+		}
 		return chromem.NewEmbeddingFuncOpenAI(cfg.EmbeddingAPIKey, chromem.EmbeddingModelOpenAI(cfg.EmbeddingModel)), nil
 	default:
 		return nil, fmt.Errorf("rag: embedding provider desconhecido: %q", cfg.EmbeddingProvider)
 	}
 }
 
+func newCustomOpenAIEmbedding(baseURL, apiKey, model string) chromem.EmbeddingFunc {
+	client := &http.Client{Timeout: 30 * time.Second}
+	baseURL = strings.TrimRight(baseURL, "/")
+
+	return func(ctx context.Context, text string) ([]float32, error) {
+		reqBody, err := json.Marshal(map[string]any{
+			"model": model,
+			"input": text,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/embeddings", bytes.NewReader(reqBody))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if apiKey != "" {
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("custom-embedding: chamar API: %w", err)
+		}
+		defer resp.Body.Close()
+
+		respData, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("custom-embedding: status %d: %s", resp.StatusCode, respData)
+		}
+
+		var out struct {
+			Data []struct {
+				Embedding []float32 `json:"embedding"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(respData, &out); err != nil {
+			return nil, fmt.Errorf("custom-embedding: unmarshal: %w", err)
+		}
+		if len(out.Data) == 0 {
+			return nil, fmt.Errorf("custom-embedding: resposta vazia do provider")
+		}
+		return out.Data[0].Embedding, nil
+	}
+}
+
+
 func (v *vectorStore) add(ctx context.Context, docs []Document) error {
 	chromemDocs := make([]chromem.Document, len(docs))
 	for i, d := range docs {
+		// Deleta o documento se já existir para garantir semântica de Upsert
+		_ = v.collection.Delete(ctx, nil, nil, d.ID)
+
 		meta := d.Meta
 		if meta == nil {
 			meta = map[string]string{}
@@ -102,7 +171,23 @@ func (v *vectorStore) add(ctx context.Context, docs []Document) error {
 			v.ann.Add(hnsw.MakeNode(d.ID, hnsw.Vector(vec)))
 		}
 	}
-	return v.collection.AddDocuments(ctx, chromemDocs, 1)
+	if err := v.collection.AddDocuments(ctx, chromemDocs, 1); err != nil {
+		return err
+	}
+	v.saveHNSW()
+	return nil
+}
+
+func (v *vectorStore) saveHNSW() {
+	if v.ann == nil || v.hnswPath == "" {
+		return
+	}
+	f, err := os.Create(v.hnswPath)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_ = v.ann.Export(f)
 }
 
 func (v *vectorStore) query(ctx context.Context, question string, topK int, where, whereDocument map[string]string) ([]SearchResult, error) {
