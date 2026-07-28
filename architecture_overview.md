@@ -82,7 +82,7 @@ graph TD
   * Resolução de metadados de chaves e saldo para o proxy Go.
   * Geração do token SSO assinado via HMAC para autenticar usuários no painel do uRag Guard.
 
-#### [proxy (Go)](file:///d:/PROJETOS/IGNUS/ignus-code-landing-page/proxy/README.md)
+#### [proxy (Go)](file:///d:/PROJETOS/IGNUS/urag-stack/urag_proxy/README.md)
 * **Papel**: Proxy reverso de alta performance posicionado antes dos provedores de LLM.
 * **Responsabilidades**:
   * Validação das chaves de API e consumo de créditos de forma atômica integrando com Next.js e Redis.
