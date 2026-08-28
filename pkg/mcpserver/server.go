@@ -182,7 +182,11 @@ func (s *Server) Run(ctx context.Context) error {
 // de escopo já registrada no SPEC.md pro transporte stdio. Bloqueia até o
 // contexto ser cancelado ou o listener falhar.
 func (s *Server) RunHTTP(ctx context.Context, addr string) error {
-	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s.mcp }, nil)
+	// Stateless+JSONResponse é a convenção da stack — sem isso, POST direto de
+	// tools/call é rejeitado com `invalid during session initialization`
+	// (achado ao corrigir o mesmo bug no urag-metadata-go, GAP-14/P15).
+	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s.mcp },
+		&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true})
 
 	mux := http.NewServeMux()
 	mux.Handle("/", mcpHandler)
