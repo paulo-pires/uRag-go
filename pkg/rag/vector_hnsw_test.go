@@ -65,10 +65,14 @@ func TestVectorStoreANNRejectsWhereDocument(t *testing.T) {
 	}
 }
 
-func TestNewVectorStoreRejectsHNSWWithPersistPath(t *testing.T) {
-	_, err := newVectorStoreWithEmbedding(Config{Index: "hnsw", PersistPath: "should-not-be-created.db"}, fakeEmbedding)
-	if err == nil {
-		t.Fatal("esperava erro ao combinar Index=hnsw com PersistPath")
+func TestNewVectorStoreSupportsHNSWWithPersistPath(t *testing.T) {
+	tempDir := t.TempDir()
+	vs, err := newVectorStoreWithEmbedding(Config{Index: "hnsw", PersistPath: tempDir}, fakeEmbedding)
+	if err != nil {
+		t.Fatalf("esperava sucesso ao combinar Index=hnsw com PersistPath: %v", err)
+	}
+	if vs == nil {
+		t.Fatal("esperava vectorStore não nulo")
 	}
 }
 

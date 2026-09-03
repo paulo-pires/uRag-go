@@ -5,6 +5,7 @@ package mcpserver
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"net/http"
 	"time"
@@ -13,6 +14,7 @@ import (
 
 	"urag-go/pkg/graph"
 	"urag-go/pkg/rag"
+	"urag-go/pkg/rollout"
 	"urag-go/pkg/router"
 	urasql "urag-go/pkg/sql"
 	"urag-go/pkg/telemetry"
@@ -59,13 +61,15 @@ type Config struct {
 
 // Server é o servidor MCP do uRag-go, com as 4 stores já instanciadas.
 type Server struct {
-	mcp    *mcp.Server
-	vector *rag.UnifiedRAG
-	graph  *graph.GraphStore
-	tree   *tree.Tree
-	sql    *urasql.Store
-	router *router.Router
-	config Config
+	mcp     *mcp.Server
+	vector  *rag.UnifiedRAG
+	graph   *graph.GraphStore
+	tree    *tree.Tree
+	sql     *urasql.Store
+	router  *router.Router
+	rollout *rollout.RolloutManager
+	replay  *rollout.ReplayEngine
+	config  Config
 }
 
 // New cria o Server: instancia vector/graph/tree sempre; sql só se cfg.SQLDSN
@@ -144,12 +148,14 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	s := &Server{
-		mcp:    mcp.NewServer(&mcp.Implementation{Name: "urag-mcp", Version: "v0.1.0"}, nil),
-		vector: vector,
-		graph:  g,
-		tree:   t,
-		sql:    sqlStore,
-		config: cfg,
+		mcp:     mcp.NewServer(&mcp.Implementation{Name: "urag-mcp", Version: "v0.1.0"}, nil),
+		vector:  vector,
+		graph:   g,
+		tree:    t,
+		sql:     sqlStore,
+		rollout: rollout.NewManager(),
+		replay:  rollout.NewDefaultReplayEngine(),
+		config:  cfg,
 	}
 
 	// Router combina todas as stores para roteamento automático
@@ -230,7 +236,7 @@ func (s *Server) RunHTTP(ctx context.Context, addr string) error {
 // autentique se for expor além de localhost.
 func withAuth(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if token != "" && r.Header.Get("X-RAG-Token") != token {
+		if token != "" && subtle.ConstantTimeCompare([]byte(r.Header.Get("X-RAG-Token")), []byte(token)) != 1 {
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}

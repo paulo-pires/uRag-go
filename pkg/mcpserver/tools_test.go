@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"hash/fnv"
 	"math"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 
 	"urag-go/pkg/graph"
 	"urag-go/pkg/rag"
+	"urag-go/pkg/rollout"
 	urasql "urag-go/pkg/sql"
 	"urag-go/pkg/tree"
 )
@@ -69,11 +71,22 @@ func newTestServer(t *testing.T, withSQL bool) *Server {
 		t.Fatalf("rag.NewWithEmbedding: %v", err)
 	}
 
+	fakeReplay := rollout.NewReplayEngine(
+		func(_ context.Context, _, _, _, _, prompt string) (string, error) {
+			return "Mocked candidate response for: " + prompt, nil
+		},
+		func(_ context.Context, _, _, _ string) (float64, float64, error) {
+			return 0.94, 0.92, nil
+		},
+	)
+
 	s := &Server{
-		mcp:    mcp.NewServer(&mcp.Implementation{Name: "test"}, nil),
-		vector: vector,
-		graph:  graph.NewWithCompletion(fakeGraphExtraction),
-		tree:   tree.NewWithNavigator(fakeTreeNavigate),
+		mcp:     mcp.NewServer(&mcp.Implementation{Name: "test"}, nil),
+		vector:  vector,
+		graph:   graph.NewWithCompletion(fakeGraphExtraction),
+		tree:    tree.NewWithNavigator(fakeTreeNavigate),
+		rollout: rollout.NewManager(),
+		replay:  fakeReplay,
 	}
 	if withSQL {
 		// DSN de arquivo real (não ":memory:") porque Store.New introspecta e
@@ -207,5 +220,179 @@ func TestServerMetricsRoute(t *testing.T) {
 	contentType := resp.Header.Get("Content-Type")
 	if !strings.HasPrefix(contentType, "text/plain") {
 		t.Errorf("esperava Content-Type text/plain, obtido %q", contentType)
+	}
+}
+
+func TestMCPConfigurePromptRollout(t *testing.T) {
+	s := newTestServer(t, false)
+	ctx := context.Background()
+
+	inputJSON := `{
+		"prompt_id": "prompt-rag-v2",
+		"strategy": "canary",
+		"base_prompt": "Você é um assistente RAG v1.",
+		"candidate_prompt": "Você é um assistente RAG v2 otimizado.",
+		"traffic_percentage": 25.0,
+		"auto_rollback": true,
+		"min_quality_score": 0.80,
+		"max_error_rate": 0.05
+	}`
+
+	var input rollout.RolloutConfig
+	if err := json.Unmarshal([]byte(inputJSON), &input); err != nil {
+		t.Fatalf("falha ao deserializar input: %v", err)
+	}
+
+	_, out, err := s.configurePromptRollout(ctx, nil, input)
+	if err != nil {
+		t.Fatalf("configurePromptRollout: %v", err)
+	}
+
+	if out.Status != "active" {
+		t.Fatalf("status esperado 'active', obtido %q", out.Status)
+	}
+	if out.State.PromptID != "prompt-rag-v2" {
+		t.Fatalf("prompt_id incorreto no estado: %s", out.State.PromptID)
+	}
+
+	outBytes, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("falha ao serializar output: %v", err)
+	}
+	if !strings.Contains(string(outBytes), "prompt-rag-v2") {
+		t.Fatalf("output JSON esperado conter prompt-rag-v2, obtido: %s", string(outBytes))
+	}
+}
+
+func TestMCPGetRolloutStatus(t *testing.T) {
+	s := newTestServer(t, false)
+	ctx := context.Background()
+
+	_, _, _ = s.configurePromptRollout(ctx, nil, rollout.RolloutConfig{
+		PromptID:        "p-status-test",
+		Strategy:        "shadow",
+		BasePrompt:      "Base",
+		CandidatePrompt: "Candidate",
+	})
+
+	inputJSON := `{"prompt_id": "p-status-test"}`
+	var input GetRolloutStatusInput
+	if err := json.Unmarshal([]byte(inputJSON), &input); err != nil {
+		t.Fatalf("falha ao deserializar input: %v", err)
+	}
+
+	_, state, err := s.getRolloutStatus(ctx, nil, input)
+	if err != nil {
+		t.Fatalf("getRolloutStatus: %v", err)
+	}
+
+	if state.PromptID != "p-status-test" || state.Config.Strategy != "shadow" {
+		t.Fatalf("estado retornado inesperado: %+v", state)
+	}
+
+	outBytes, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("falha ao serializar output: %v", err)
+	}
+	if !strings.Contains(string(outBytes), "p-status-test") {
+		t.Fatalf("JSON não contém id: %s", string(outBytes))
+	}
+}
+
+func TestMCPEvaluateRolloutDecision(t *testing.T) {
+	s := newTestServer(t, false)
+	ctx := context.Background()
+
+	_, _, _ = s.configurePromptRollout(ctx, nil, rollout.RolloutConfig{
+		PromptID:          "p-eval-test",
+		Strategy:          "canary",
+		BasePrompt:        "Prompt Base",
+		CandidatePrompt:   "Prompt Candidate",
+		TrafficPercentage: 50.0,
+	})
+
+	inputJSON := `{"prompt_id": "p-eval-test", "sticky_key": "tenant-42"}`
+	var input EvaluateRolloutDecisionInput
+	if err := json.Unmarshal([]byte(inputJSON), &input); err != nil {
+		t.Fatalf("falha ao deserializar input: %v", err)
+	}
+
+	_, decision, err := s.evaluateRolloutDecision(ctx, nil, input)
+	if err != nil {
+		t.Fatalf("evaluateRolloutDecision: %v", err)
+	}
+
+	if decision.PromptID != "p-eval-test" {
+		t.Fatalf("prompt_id incorreto na decisão: %s", decision.PromptID)
+	}
+	if decision.SelectedVariant != "base" && decision.SelectedVariant != "candidate" {
+		t.Fatalf("variante inválida: %s", decision.SelectedVariant)
+	}
+	if decision.Prompt == "" {
+		t.Fatal("prompt vazio na decisão")
+	}
+
+	outBytes, err := json.Marshal(decision)
+	if err != nil {
+		t.Fatalf("falha ao serializar output: %v", err)
+	}
+	if !strings.Contains(string(outBytes), "selected_variant") {
+		t.Fatalf("JSON não contém selected_variant: %s", string(outBytes))
+	}
+}
+
+func TestMCPReplayTraces(t *testing.T) {
+	s := newTestServer(t, false)
+	ctx := context.Background()
+
+	inputJSON := `{
+		"traces": [
+			{
+				"trace_id": "trace-101",
+				"prompt_id": "p-rag",
+				"input": "Como emitir nota fiscal?",
+				"original_prompt": "Base prompt",
+				"original_output": "Acesse o módulo fiscal e clique em emitir.",
+				"original_score": 0.85,
+				"original_latency_ms": 300.0,
+				"original_tokens": 25
+			}
+		],
+		"config": {
+			"candidate_prompt": "Você é especialista fiscal. Pergunta: {{input}}",
+			"min_fidelity": 0.80,
+			"concurrency": 2
+		}
+	}`
+
+	var input ReplayTracesInput
+	if err := json.Unmarshal([]byte(inputJSON), &input); err != nil {
+		t.Fatalf("falha ao deserializar input: %v", err)
+	}
+
+	_, summary, err := s.replayTraces(ctx, nil, input)
+	if err != nil {
+		t.Fatalf("replayTraces: %v", err)
+	}
+
+	if summary.TotalTraces != 1 {
+		t.Fatalf("TotalTraces = %d, esperado 1", summary.TotalTraces)
+	}
+	if summary.SuccessfulReplays != 1 {
+		t.Fatalf("SuccessfulReplays = %d, esperado 1", summary.SuccessfulReplays)
+	}
+	if summary.AvgFidelity <= 0 {
+		t.Fatalf("AvgFidelity = %f, esperado > 0", summary.AvgFidelity)
+	}
+	if len(summary.Results) != 1 || !summary.Results[0].Passed {
+		t.Fatalf("resultado inesperado: %+v", summary.Results)
+	}
+
+	outBytes, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatalf("falha ao serializar output: %v", err)
+	}
+	if !strings.Contains(string(outBytes), "avg_fidelity") {
+		t.Fatalf("JSON não contém avg_fidelity: %s", string(outBytes))
 	}
 }

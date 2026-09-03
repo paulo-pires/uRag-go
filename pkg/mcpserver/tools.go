@@ -7,10 +7,11 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"urag-go/pkg/rag"
+	"urag-go/pkg/rollout"
 )
 
 // registerTools registra as tools MCP: 6 sempre (vector/graph/tree, add+query
-// cada), mais sql_query/sql_load só se s.sql != nil.
+// cada), mais sql_query/sql_load só se s.sql != nil, e as 4 tools de replay/rollout.
 func (s *Server) registerTools() {
 	mcp.AddTool(s.mcp, &mcp.Tool{Name: "vector_add", Description: "Adiciona documentos ao Vector RAG (busca por similaridade semântica)."}, s.vectorAdd)
 	mcp.AddTool(s.mcp, &mcp.Tool{Name: "vector_query", Description: "Busca por similaridade semântica no Vector RAG. Retorna confidence score em cada resultado."}, s.vectorQuery)
@@ -29,6 +30,26 @@ func (s *Server) registerTools() {
 	if s.sql != nil {
 		mcp.AddTool(s.mcp, &mcp.Tool{Name: "sql_query", Description: "Converte a pergunta em SQL (SELECT) e executa contra o banco configurado."}, s.sqlQuery)
 		mcp.AddTool(s.mcp, &mcp.Tool{Name: "sql_load", Description: "Cria uma tabela e importa dados estruturados em CSV ou JSON."}, s.sqlLoad)
+	}
+	if s.replay != nil {
+		mcp.AddTool(s.mcp, &mcp.Tool{
+			Name:        "replay_traces",
+			Description: "Executa replay de traces históricos de produção contra uma versão candidata de prompt ou modelo e gera relatório de deltas (fidelidade, latência, score e tokens).",
+		}, s.replayTraces)
+	}
+	if s.rollout != nil {
+		mcp.AddTool(s.mcp, &mcp.Tool{
+			Name:        "configure_prompt_rollout",
+			Description: "Configura estratégia de rollout gradual (canary, shadow ou ab_test) para um prompt com guardrails de auto-rollback.",
+		}, s.configurePromptRollout)
+		mcp.AddTool(s.mcp, &mcp.Tool{
+			Name:        "get_rollout_status",
+			Description: "Consulta o estado atual, métricas de performance das variantes e histórico de rollback de um prompt.",
+		}, s.getRolloutStatus)
+		mcp.AddTool(s.mcp, &mcp.Tool{
+			Name:        "evaluate_rollout_decision",
+			Description: "Resolve qual versão do prompt deve ser executada para uma requisição com base no tenant/user e estratégia ativa.",
+		}, s.evaluateRolloutDecision)
 	}
 }
 
@@ -431,4 +452,76 @@ func (s *Server) routerQuery(ctx context.Context, _ *mcp.CallToolRequest, in Rou
 	}
 
 	return nil, out, nil
+}
+
+// ─── Replay & Rollout Tools ──────────────────────────────────────────────────
+
+// ReplayTracesInput define o input para a tool replay_traces.
+type ReplayTracesInput struct {
+	Traces []rollout.TraceRecord `json:"traces" jsonschema:"lista de traces históricos de produção"`
+	Config rollout.ReplayConfig  `json:"config" jsonschema:"configurações de replay (prompt candidato, modelo, etc.)"`
+}
+
+func (s *Server) replayTraces(ctx context.Context, _ *mcp.CallToolRequest, in ReplayTracesInput) (*mcp.CallToolResult, rollout.ReplayBatchSummary, error) {
+	if s.replay == nil {
+		return nil, rollout.ReplayBatchSummary{}, fmt.Errorf("replay engine não inicializado")
+	}
+	summary, err := s.replay.Replay(ctx, in.Traces, in.Config)
+	if err != nil {
+		return nil, rollout.ReplayBatchSummary{}, err
+	}
+	return nil, summary, nil
+}
+
+// ConfigurePromptRolloutOutput define o output para a tool configure_prompt_rollout.
+type ConfigurePromptRolloutOutput struct {
+	Status string               `json:"status"`
+	State  rollout.RolloutState `json:"state"`
+}
+
+func (s *Server) configurePromptRollout(ctx context.Context, _ *mcp.CallToolRequest, in rollout.RolloutConfig) (*mcp.CallToolResult, ConfigurePromptRolloutOutput, error) {
+	if s.rollout == nil {
+		return nil, ConfigurePromptRolloutOutput{}, fmt.Errorf("rollout manager não inicializado")
+	}
+	state, err := s.rollout.ConfigureRollout(in)
+	if err != nil {
+		return nil, ConfigurePromptRolloutOutput{}, err
+	}
+	return nil, ConfigurePromptRolloutOutput{
+		Status: state.Status,
+		State:  *state,
+	}, nil
+}
+
+// GetRolloutStatusInput define o input para a tool get_rollout_status.
+type GetRolloutStatusInput struct {
+	PromptID string `json:"prompt_id" jsonschema:"identificador único do prompt"`
+}
+
+func (s *Server) getRolloutStatus(ctx context.Context, _ *mcp.CallToolRequest, in GetRolloutStatusInput) (*mcp.CallToolResult, rollout.RolloutState, error) {
+	if s.rollout == nil {
+		return nil, rollout.RolloutState{}, fmt.Errorf("rollout manager não inicializado")
+	}
+	state, err := s.rollout.GetStatus(in.PromptID)
+	if err != nil {
+		return nil, rollout.RolloutState{}, err
+	}
+	return nil, *state, nil
+}
+
+// EvaluateRolloutDecisionInput define o input para a tool evaluate_rollout_decision.
+type EvaluateRolloutDecisionInput struct {
+	PromptID  string `json:"prompt_id" jsonschema:"identificador único do prompt"`
+	StickyKey string `json:"sticky_key,omitempty" jsonschema:"chave de sticky routing (tenant_id, user_id, request_id)"`
+}
+
+func (s *Server) evaluateRolloutDecision(ctx context.Context, _ *mcp.CallToolRequest, in EvaluateRolloutDecisionInput) (*mcp.CallToolResult, rollout.RolloutDecision, error) {
+	if s.rollout == nil {
+		return nil, rollout.RolloutDecision{}, fmt.Errorf("rollout manager não inicializado")
+	}
+	decision, err := s.rollout.EvaluateDecision(in.PromptID, in.StickyKey)
+	if err != nil {
+		return nil, rollout.RolloutDecision{}, err
+	}
+	return nil, decision, nil
 }
