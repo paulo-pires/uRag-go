@@ -2,7 +2,7 @@
 # de propósito (ver SPEC.md, seção "Fase 2 — ANN (HNSW)" e "Fase 3 — Text-to-SQL"
 # pra história de por que CGO foi evitado). Isso permite compilar contra
 # uma base mínima sem toolchain C.
-FROM golang:1.25-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 
 COPY go.mod go.sum ./
