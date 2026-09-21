@@ -3,11 +3,10 @@
 # pra história de por que CGO foi evitado). Isso permite compilar contra
 # uma base mínima sem toolchain C.
 FROM golang:1.25-alpine AS build
-WORKDIR /src
-
+WORKDIR /work/uRag-go
 COPY go.mod go.sum ./
+COPY --from=glitchtip . /work/pkg/glitchtip
 RUN go mod download
-
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o /out/urag ./cmd/urag
 

@@ -23,6 +23,7 @@ import (
 	urasql "urag-go/pkg/sql"
 	"urag-go/pkg/telemetry"
 	"urag-go/pkg/tree"
+	"urag-stack/pkg/glitchtip"
 )
 
 func main() {
@@ -527,6 +528,9 @@ func runRouter(args []string) {
 }
 
 func runMCP(args []string) {
+	glitchtip.InitFromEnv("urag-go")
+	defer glitchtip.Flush()
+
 	if len(args) < 1 || args[0] != "serve" {
 		fmt.Fprintln(os.Stderr, "uso: urag mcp serve [-db <path>] [-llm-model <model>] [-sql-dsn <path>] [-embedding-provider ollama|openai] [-embedding-model <model>] [-embedding-api-key <key>] [-graph-persist <dsn>] [-embedding-cache-size <size>] [-embedding-cache-ttl <ttl>]")
 		os.Exit(1)
