@@ -8,6 +8,7 @@ import (
 	"crypto/subtle"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -19,6 +20,7 @@ import (
 	urasql "urag-go/pkg/sql"
 	"urag-go/pkg/telemetry"
 	"urag-go/pkg/tree"
+	"urag-stack/pkg/glitchtip"
 )
 
 // Config configura o servidor MCP.
@@ -198,6 +200,8 @@ func (s *Server) RunHTTP(ctx context.Context, addr string) error {
 	mux.Handle("/", mcpHandler)
 	mux.HandleFunc("/mcp/stream", s.handleStream)
 	mux.HandleFunc("/metrics", s.handleMetrics)
+	tok := os.Getenv("URAG_INTERNAL_TOKEN")
+	mux.HandleFunc("/internal/glitchtip-test", glitchtip.RequireToken("X-Internal-Token", tok, glitchtip.TestHandler("urag-go")))
 
 	healthHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -212,10 +216,14 @@ func (s *Server) RunHTTP(ctx context.Context, addr string) error {
 			healthHandler.ServeHTTP(w, r)
 			return
 		}
+		if r.URL.Path == "/internal/glitchtip-test" {
+			mux.ServeHTTP(w, r)
+			return
+		}
 		authedHandler.ServeHTTP(w, r)
 	})
 
-	httpServer := &http.Server{Addr: addr, Handler: mainHandler}
+	httpServer := &http.Server{Addr: addr, Handler: glitchtip.Wrap(mainHandler)}
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- httpServer.ListenAndServe() }()
@@ -224,7 +232,9 @@ func (s *Server) RunHTTP(ctx context.Context, addr string) error {
 	case err := <-errCh:
 		return err
 	case <-ctx.Done():
-		return httpServer.Shutdown(context.Background())
+		_ = httpServer.Shutdown(context.Background())
+		glitchtip.Flush()
+		return nil
 	}
 }
 
